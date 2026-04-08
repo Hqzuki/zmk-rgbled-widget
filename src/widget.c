@@ -7,20 +7,16 @@
 #include <zmk/battery.h>
 #include <zmk/ble.h>
 #include <zmk/endpoints.h>
+#include <zmk/events/activity_state_changed.h>
 #include <zmk/events/battery_state_changed.h>
 #include <zmk/events/ble_active_profile_changed.h>
 #include <zmk/events/endpoint_changed.h>
 #include <zmk/events/layer_state_changed.h>
 #include <zmk/events/split_peripheral_status_changed.h>
-#include <zmk/events/activity_state_changed.h>
 #include <zmk/keymap.h>
 #include <zmk/split/bluetooth/peripheral.h>
 
-#if __has_include(<zmk/split/central.h>)
 #include <zmk/split/central.h>
-#else
-#include <zmk/split/bluetooth/central.h>
-#endif
 
 #include <zephyr/logging/log.h>
 
@@ -43,9 +39,11 @@ BUILD_ASSERT(!(SHOW_LAYER_CHANGE && SHOW_LAYER_COLORS),
 
 // GPIO-based LED device and indices of red/green/blue LEDs inside its DT node
 static const struct device *led_dev = DEVICE_DT_GET(LED_GPIO_NODE_ID);
-static const uint8_t rgb_idx[] = {DT_NODE_CHILD_IDX(DT_ALIAS(led_red)),
-                                  DT_NODE_CHILD_IDX(DT_ALIAS(led_green)),
-                                  DT_NODE_CHILD_IDX(DT_ALIAS(led_blue))};
+static const uint8_t rgb_idx[] = {
+    DT_NODE_CHILD_IDX(DT_ALIAS(led_red)),
+    DT_NODE_CHILD_IDX(DT_ALIAS(led_green)),
+    DT_NODE_CHILD_IDX(DT_ALIAS(led_blue)),
+};
 
 // map from color values to names, for logging
 static const char *color_names[] = {"black", "red",     "green", "yellow",
@@ -93,20 +91,20 @@ struct blink_item {
 // flag to indicate whether the initial boot up sequence is complete
 static bool initialized = false;
 
-// current physical LED color
-uint8_t led_current_color = 0;
+// current physical LED output color
+static uint8_t led_current_color = 0;
 
-// persistent/base color restored after temporary blinks
+// persistent "base" color restored after temporary blinks
 // central: layer color
 // peripheral: battery color
-uint8_t led_persistent_color = 0;
+static uint8_t led_persistent_color = 0;
+static bool led_sleeping = false;
 
 // low-level method to control the LED
 static void set_rgb_leds(uint8_t color, uint16_t duration_ms) {
     for (uint8_t pos = 0; pos < 3; pos++) {
         uint8_t bit = BIT(pos);
         if ((bit & led_current_color) != (bit & color)) {
-            // bits are different, so we need to change one
             if (bit & color) {
                 led_on(led_dev, rgb_idx[pos]);
             } else {
@@ -128,27 +126,34 @@ static void indicate_connectivity_internal(void) {
     struct blink_item blink = {.duration_ms = CONFIG_RGBLED_WIDGET_CONN_BLINK_MS};
 
 #if !IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
-    switch (zmk_endpoints_selected().transport) {
+#if IS_ENABLED(CONFIG_ZMK_BLE)
+    uint8_t profile_index = zmk_ble_active_profile_index();
+#endif
+
+    switch (zmk_endpoint_get_selected().transport) {
     case ZMK_TRANSPORT_USB:
 #if IS_ENABLED(CONFIG_RGBLED_WIDGET_CONN_SHOW_USB)
         LOG_INF("USB connected, blinking %s", color_names[CONFIG_RGBLED_WIDGET_CONN_COLOR_USB]);
         blink.color = CONFIG_RGBLED_WIDGET_CONN_COLOR_USB;
         break;
 #endif
-    default: // ZMK_TRANSPORT_BLE
+    case ZMK_TRANSPORT_BLE:
 #if IS_ENABLED(CONFIG_ZMK_BLE)
-        uint8_t profile_index = zmk_ble_active_profile_index();
-        if (zmk_ble_active_profile_is_connected()) {
-            LOG_CONN_CENTRAL(profile_index, "connected", CONNECTED);
-            blink.color = CONFIG_RGBLED_WIDGET_CONN_COLOR_CONNECTED;
-        } else if (zmk_ble_active_profile_is_open()) {
+        LOG_CONN_CENTRAL(profile_index, "connected", CONNECTED);
+        blink.color = CONFIG_RGBLED_WIDGET_CONN_COLOR_CONNECTED;
+        break;
+#endif
+    default:
+#if IS_ENABLED(CONFIG_ZMK_BLE)
+        if (zmk_endpoint_get_preferred_transport() != ZMK_TRANSPORT_NONE &&
+            zmk_ble_active_profile_is_open()) {
             LOG_CONN_CENTRAL(profile_index, "open", ADVERTISING);
             blink.color = CONFIG_RGBLED_WIDGET_CONN_COLOR_ADVERTISING;
-        } else {
-            LOG_CONN_CENTRAL(profile_index, "not connected", DISCONNECTED);
-            blink.color = CONFIG_RGBLED_WIDGET_CONN_COLOR_DISCONNECTED;
+            break;
         }
 #endif
+        LOG_CONN_CENTRAL(-1, "no endpoints connected", DISCONNECTED);
+        blink.color = CONFIG_RGBLED_WIDGET_CONN_COLOR_DISCONNECTED;
         break;
     }
 #elif IS_ENABLED(CONFIG_ZMK_SPLIT_BLE)
@@ -179,15 +184,13 @@ void indicate_connectivity() { k_work_reschedule(&indicate_connectivity_work, K_
 ZMK_LISTENER(led_output_listener, led_output_listener_cb);
 
 #if !IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
-// run led_output_listener_cb on endpoint and BLE profile change (on central)
 #if IS_ENABLED(CONFIG_RGBLED_WIDGET_CONN_SHOW_USB)
 ZMK_SUBSCRIPTION(led_output_listener, zmk_endpoint_changed);
 #endif
 #if IS_ENABLED(CONFIG_ZMK_BLE)
 ZMK_SUBSCRIPTION(led_output_listener, zmk_ble_active_profile_changed);
-#endif // IS_ENABLED(CONFIG_ZMK_BLE)
+#endif
 #elif IS_ENABLED(CONFIG_ZMK_SPLIT_BLE)
-// run led_output_listener_cb on peripheral status change event
 ZMK_SUBSCRIPTION(led_output_listener, zmk_split_peripheral_status_changed);
 #endif
 
@@ -230,22 +233,14 @@ void indicate_battery(void) {
     IS_ENABLED(CONFIG_RGBLED_WIDGET_BATTERY_SHOW_ONLY_PERIPHERALS)
     for (uint8_t i = 0; i < ZMK_SPLIT_BLE_PERIPHERAL_COUNT; i++) {
         uint8_t peripheral_level;
-#if __has_include(<zmk/split/central.h>)
         int ret = zmk_split_central_get_peripheral_battery_level(i, &peripheral_level);
-#else
-        int ret = zmk_split_get_peripheral_battery_level(i, &peripheral_level);
-#endif
         if (ret == 0) {
             retry = 0;
-            while (peripheral_level == 0 && retry++ < (CONFIG_RGBLED_WIDGET_BATTERY_BLINK_MS +
-                                                       CONFIG_RGBLED_WIDGET_INTERVAL_MS) /
-                                                          100) {
+            while (peripheral_level == 0 &&
+                   retry++ < (CONFIG_RGBLED_WIDGET_BATTERY_BLINK_MS +
+                              CONFIG_RGBLED_WIDGET_INTERVAL_MS) / 100) {
                 k_sleep(K_MSEC(100));
-#if __has_include(<zmk/split/central.h>)
                 zmk_split_central_get_peripheral_battery_level(i, &peripheral_level);
-#else
-                zmk_split_get_peripheral_battery_level(i, &peripheral_level);
-#endif
             }
 
             LOG_INF("Got battery level for peripheral %d:", i);
@@ -257,27 +252,78 @@ void indicate_battery(void) {
     }
 #endif
 }
+#endif // IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
 
-#if IS_ENABLED(CONFIG_ZMK_SPLIT) && !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
-static void update_battery_persistent_color(void) {
-    uint8_t battery_level = zmk_battery_state_of_charge();
+#if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING) && IS_ENABLED(CONFIG_ZMK_SPLIT) &&                    \
+    !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+static struct k_work_delayable battery_critical_blink_work;
 
-    if (battery_level == 0) {
-        LOG_INF("Battery level is 0, skip persistent battery color update");
+static void sync_battery_critical_blink(uint8_t battery_level) {
+    if (!initialized || led_sleeping || battery_level == 0 ||
+        battery_level > CONFIG_RGBLED_WIDGET_BATTERY_LEVEL_CRITICAL) {
+        k_work_cancel_delayable(&battery_critical_blink_work);
         return;
     }
 
+    k_work_reschedule(&battery_critical_blink_work, K_NO_WAIT);
+}
+
+static void battery_critical_blink_cb(struct k_work *work) {
+    ARG_UNUSED(work);
+
+    uint8_t battery_level = zmk_battery_state_of_charge();
+    if (!initialized || led_sleeping || battery_level == 0 ||
+        battery_level > CONFIG_RGBLED_WIDGET_BATTERY_LEVEL_CRITICAL) {
+        return;
+    }
+
+    struct blink_item blink = {
+        .duration_ms = CONFIG_RGBLED_WIDGET_BATTERY_BLINK_MS,
+        .color = CONFIG_RGBLED_WIDGET_BATTERY_COLOR_CRITICAL,
+    };
+    k_msgq_put(&led_msgq, &blink, K_NO_WAIT);
+    k_work_reschedule(&battery_critical_blink_work,
+                      K_MSEC(CONFIG_RGBLED_WIDGET_BATTERY_BLINK_MS +
+                             CONFIG_RGBLED_WIDGET_INTERVAL_MS));
+}
+
+static void update_battery_persistent_color(void) {
+    uint8_t battery_level = zmk_battery_state_of_charge();
     uint8_t color = get_battery_color(battery_level);
 
     if (led_persistent_color != color) {
         led_persistent_color = color;
         struct blink_item item = {.color = led_persistent_color};
-        LOG_INF("Setting persistent battery color to %s", color_names[led_persistent_color]);
         k_msgq_put(&led_msgq, &item, K_NO_WAIT);
+    }
+
+    sync_battery_critical_blink(battery_level);
+}
+#endif
+
+#if SHOW_LAYER_COLORS && (!IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL))
+static void update_layer_color(void) {
+    uint8_t index = zmk_keymap_highest_layer_active();
+
+    if (led_persistent_color != layer_color_idx[index]) {
+        led_persistent_color = layer_color_idx[index];
+        struct blink_item color = {.color = led_persistent_color};
+        LOG_INF("Setting layer color to %s for layer %d", color_names[led_persistent_color], index);
+        k_msgq_put(&led_msgq, &color, K_NO_WAIT);
     }
 }
 #endif
 
+static void update_persistent_color(void) {
+#if SHOW_LAYER_COLORS && (!IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL))
+    update_layer_color();
+#elif IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING) && IS_ENABLED(CONFIG_ZMK_SPLIT) &&                  \
+    !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+    update_battery_persistent_color();
+#endif
+}
+
+#if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
 static int led_battery_listener_cb(const zmk_event_t *eh) {
     if (!initialized) {
         return 0;
@@ -285,79 +331,80 @@ static int led_battery_listener_cb(const zmk_event_t *eh) {
 
 #if IS_ENABLED(CONFIG_ZMK_SPLIT) && !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
     update_battery_persistent_color();
+    return 0;
 #endif
 
-    // check if we are in critical battery levels at state change, blink if we are
     uint8_t battery_level = as_zmk_battery_state_changed(eh)->state_of_charge;
 
     if (battery_level > 0 && battery_level <= CONFIG_RGBLED_WIDGET_BATTERY_LEVEL_CRITICAL) {
         LOG_BATTERY(battery_level, CRITICAL);
 
-        struct blink_item blink = {.duration_ms = CONFIG_RGBLED_WIDGET_BATTERY_BLINK_MS,
-                                   .color = CONFIG_RGBLED_WIDGET_BATTERY_COLOR_CRITICAL};
+        struct blink_item blink = {
+            .duration_ms = CONFIG_RGBLED_WIDGET_BATTERY_BLINK_MS,
+            .color = CONFIG_RGBLED_WIDGET_BATTERY_COLOR_CRITICAL,
+        };
         k_msgq_put(&led_msgq, &blink, K_NO_WAIT);
     }
     return 0;
 }
 
-// run led_battery_listener_cb on battery state change event
 ZMK_LISTENER(led_battery_listener, led_battery_listener_cb);
 ZMK_SUBSCRIPTION(led_battery_listener, zmk_battery_state_changed);
-#endif // IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
+#endif
 
-uint8_t led_layer_color = 0;
-#if SHOW_LAYER_COLORS
-void update_layer_color(void) {
-    uint8_t index = zmk_keymap_highest_layer_active();
-
-    if (led_layer_color != layer_color_idx[index]) {
-        led_layer_color = layer_color_idx[index];
-        led_persistent_color = led_layer_color;
-        struct blink_item color = {.color = led_layer_color};
-        LOG_INF("Setting layer color to %s for layer %d", color_names[led_layer_color], index);
-        k_msgq_put(&led_msgq, &color, K_NO_WAIT);
-    }
-}
-
-static int led_layer_color_listener_cb(const zmk_event_t *eh) {
+static int led_persistent_listener_cb(const zmk_event_t *eh) {
     struct zmk_activity_state_changed *ev = as_zmk_activity_state_changed(eh);
 
-    // check if this is indeed an activity state changed event
     if (ev != NULL) {
         switch (ev->state) {
         case ZMK_ACTIVITY_SLEEP:
             LOG_INF("Detected sleep activity state, turn off LED");
+            led_sleeping = true;
+#if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING) && IS_ENABLED(CONFIG_ZMK_SPLIT) &&                    \
+    !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+            k_work_cancel_delayable(&battery_critical_blink_work);
+#endif
             set_rgb_leds(0, 0);
             break;
-        default: // not handling IDLE and ACTIVE yet
+        case ZMK_ACTIVITY_ACTIVE:
+        case ZMK_ACTIVITY_IDLE:
+            led_sleeping = false;
+            if (initialized) {
+                update_persistent_color();
+            }
+            break;
+        default:
             break;
         }
         return 0;
     }
 
-    // it must be a layer change event instead
     if (initialized) {
-#if !IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
-        update_layer_color();
-#endif
+        update_persistent_color();
     }
     return 0;
 }
 
-// run layer_color_listener_cb on layer status change event and activity state event
-ZMK_LISTENER(led_layer_color_listener, led_layer_color_listener_cb);
-ZMK_SUBSCRIPTION(led_layer_color_listener, zmk_layer_state_changed);
-ZMK_SUBSCRIPTION(led_layer_color_listener, zmk_activity_state_changed);
-#endif // SHOW_LAYER_COLORS
+ZMK_LISTENER(led_persistent_listener, led_persistent_listener_cb);
+ZMK_SUBSCRIPTION(led_persistent_listener, zmk_activity_state_changed);
+
+#if SHOW_LAYER_COLORS && (!IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL))
+ZMK_SUBSCRIPTION(led_persistent_listener, zmk_layer_state_changed);
+#endif
 
 #if !IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
 void indicate_layer(void) {
     uint8_t index = zmk_keymap_highest_layer_active();
-    static const struct blink_item blink = {.duration_ms = CONFIG_RGBLED_WIDGET_LAYER_BLINK_MS,
-                                            .color = CONFIG_RGBLED_WIDGET_LAYER_COLOR,
-                                            .sleep_ms = CONFIG_RGBLED_WIDGET_LAYER_BLINK_MS};
-    static const struct blink_item last_blink = {.duration_ms = CONFIG_RGBLED_WIDGET_LAYER_BLINK_MS,
-                                                 .color = CONFIG_RGBLED_WIDGET_LAYER_COLOR};
+    static const struct blink_item blink = {
+        .duration_ms = CONFIG_RGBLED_WIDGET_LAYER_BLINK_MS,
+        .color = CONFIG_RGBLED_WIDGET_LAYER_COLOR,
+        .sleep_ms = CONFIG_RGBLED_WIDGET_LAYER_BLINK_MS,
+    };
+    static const struct blink_item last_blink = {
+        .duration_ms = CONFIG_RGBLED_WIDGET_LAYER_BLINK_MS,
+        .color = CONFIG_RGBLED_WIDGET_LAYER_COLOR,
+    };
+
     LOG_INF("Blinking %d times %s for layer change", index,
             color_names[CONFIG_RGBLED_WIDGET_LAYER_COLOR]);
 
@@ -369,13 +416,12 @@ void indicate_layer(void) {
         }
     }
 }
-#endif // !IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+#endif
 
 #if SHOW_LAYER_CHANGE
 static struct k_work_delayable layer_indicate_work;
 
 static int led_layer_listener_cb(const zmk_event_t *eh) {
-    // ignore if not initialized yet or layer off events
     if (initialized && as_zmk_layer_state_changed(eh)->state) {
         k_work_reschedule(&layer_indicate_work, K_MSEC(CONFIG_RGBLED_WIDGET_LAYER_DEBOUNCE_MS));
     }
@@ -386,7 +432,7 @@ static void indicate_layer_cb(struct k_work *work) { indicate_layer(); }
 
 ZMK_LISTENER(led_layer_listener, led_layer_listener_cb);
 ZMK_SUBSCRIPTION(led_layer_listener, zmk_layer_state_changed);
-#endif // SHOW_LAYER_CHANGE
+#endif
 
 extern void led_process_thread(void *d0, void *d1, void *d2) {
     ARG_UNUSED(d0);
@@ -398,36 +444,39 @@ extern void led_process_thread(void *d0, void *d1, void *d2) {
 #if SHOW_LAYER_CHANGE
     k_work_init_delayable(&layer_indicate_work, indicate_layer_cb);
 #endif
+#if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING) && IS_ENABLED(CONFIG_ZMK_SPLIT) &&                    \
+    !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+    k_work_init_delayable(&battery_critical_blink_work, battery_critical_blink_cb);
+#endif
 
     while (true) {
-        // wait until a blink item is received and process it
         struct blink_item blink;
         k_msgq_get(&led_msgq, &blink, K_FOREVER);
+
         if (blink.duration_ms > 0) {
             LOG_DBG("Got a blink item from msgq, color %d, duration %d", blink.color,
                     blink.duration_ms);
 
-            // Blink the leds, using a separation blink if necessary
             if (blink.color == led_current_color && blink.color > 0) {
                 set_rgb_leds(0, CONFIG_RGBLED_WIDGET_INTERVAL_MS);
             }
+
             set_rgb_leds(blink.color, blink.duration_ms);
+
             if (blink.color == led_persistent_color && blink.color > 0) {
                 set_rgb_leds(0, CONFIG_RGBLED_WIDGET_INTERVAL_MS);
             }
-            // wait interval before processing another blink
-            set_rgb_leds(led_persistent_color,
-                         blink.sleep_ms > 0 ? blink.sleep_ms : CONFIG_RGBLED_WIDGET_INTERVAL_MS);
 
+            set_rgb_leds(led_persistent_color,
+                         blink.sleep_ms > 0 ? blink.sleep_ms
+                                            : CONFIG_RGBLED_WIDGET_INTERVAL_MS);
         } else {
-            LOG_DBG("Got a layer color item from msgq, color %d", blink.color);
+            LOG_DBG("Got a persistent color item from msgq, color %d", blink.color);
             set_rgb_leds(blink.color, 0);
         }
     }
 }
 
-// define led_process_thread with stack size 1024, start running it 100 ms after
-// boot
 K_THREAD_DEFINE(led_process_tid, 1024, led_process_thread, NULL, NULL, NULL,
                 K_LOWEST_APPLICATION_THREAD_PRIO, 0, 100);
 
@@ -437,36 +486,20 @@ extern void led_init_thread(void *d0, void *d1, void *d2) {
     ARG_UNUSED(d2);
 
 #if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
-    // check and indicate battery level on thread start
     LOG_INF("Indicating initial battery status");
-
     indicate_battery();
-
-    // wait until blink should be displayed for further checks
     k_sleep(K_MSEC(CONFIG_RGBLED_WIDGET_BATTERY_BLINK_MS + CONFIG_RGBLED_WIDGET_INTERVAL_MS));
-#endif // IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
+#endif
 
-    // check and indicate current profile or peripheral connectivity status
     LOG_INF("Indicating initial connectivity status");
     indicate_connectivity();
 
-#if SHOW_LAYER_COLORS
-#if !IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
-    LOG_INF("Setting initial layer color");
-    update_layer_color();
-#endif
-#endif // SHOW_LAYER_COLORS
-
-#if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING) && IS_ENABLED(CONFIG_ZMK_SPLIT) &&                    \
-    !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
-    LOG_INF("Setting initial battery persistent color");
-    update_battery_persistent_color();
-#endif
+    LOG_INF("Setting initial persistent color");
+    update_persistent_color();
 
     initialized = true;
     LOG_INF("Finished initializing LED widget");
 }
 
-// run init thread on boot for initial battery+output checks
 K_THREAD_DEFINE(led_init_tid, 1024, led_init_thread, NULL, NULL, NULL,
                 K_LOWEST_APPLICATION_THREAD_PRIO, 0, 200);
