@@ -130,7 +130,7 @@ static void indicate_connectivity_internal(void) {
     uint8_t profile_index = zmk_ble_active_profile_index();
 #endif
 
-    switch (zmk_endpoint_get_selected().transport) {
+    switch (zmk_endpoints_selected().transport) {
     case ZMK_TRANSPORT_USB:
 #if IS_ENABLED(CONFIG_RGBLED_WIDGET_CONN_SHOW_USB)
         LOG_INF("USB connected, blinking %s", color_names[CONFIG_RGBLED_WIDGET_CONN_COLOR_USB]);
