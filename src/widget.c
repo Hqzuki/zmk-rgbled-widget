@@ -286,8 +286,10 @@ static void battery_critical_blink_cb(struct k_work *work) {
                              CONFIG_RGBLED_WIDGET_INTERVAL_MS));
 }
 
-static void update_battery_persistent_color(void) {
-    uint8_t battery_level = zmk_battery_state_of_charge();
+static void update_battery_persistent_color(uint8_t battery_level) {
+    if (battery_level == 0) {
+        battery_level = zmk_battery_state_of_charge();
+    }
     uint8_t color = get_battery_color(battery_level);
 
     if (led_persistent_color != color) {
@@ -318,7 +320,7 @@ static void update_persistent_color(void) {
     update_layer_color();
 #elif IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING) && IS_ENABLED(CONFIG_ZMK_SPLIT) &&                  \
     !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
-    update_battery_persistent_color();
+    update_battery_persistent_color(0);
 #endif
 }
 
@@ -329,7 +331,7 @@ static int led_battery_listener_cb(const zmk_event_t *eh) {
     }
 
 #if IS_ENABLED(CONFIG_ZMK_SPLIT) && !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
-    update_battery_persistent_color();
+    update_battery_persistent_color(as_zmk_battery_state_changed(eh)->state_of_charge);
     return 0;
 #endif
 
