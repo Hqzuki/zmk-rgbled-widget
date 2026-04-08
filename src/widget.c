@@ -145,8 +145,7 @@ static void indicate_connectivity_internal(void) {
 #endif
     default:
 #if IS_ENABLED(CONFIG_ZMK_BLE)
-        if (zmk_endpoint_get_preferred_transport() != ZMK_TRANSPORT_NONE &&
-            zmk_ble_active_profile_is_open()) {
+        if (zmk_ble_active_profile_is_open()) {
             LOG_CONN_CENTRAL(profile_index, "open", ADVERTISING);
             blink.color = CONFIG_RGBLED_WIDGET_CONN_COLOR_ADVERTISING;
             break;
