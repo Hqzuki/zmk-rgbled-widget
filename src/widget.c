@@ -256,13 +256,11 @@ void indicate_battery(void) {
 #if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING) && IS_ENABLED(CONFIG_ZMK_SPLIT) &&                    \
     !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
 static void update_battery_persistent_color(void) {
-    uint8_t battery_level = zmk_battery_state_of_charge();
-    uint8_t color = get_battery_color(battery_level);
+    uint8_t color = 2; // green固定
 
     if (led_persistent_color != color) {
         led_persistent_color = color;
         struct blink_item item = {.color = led_persistent_color};
-        LOG_INF("Setting persistent battery color to %s", color_names[led_persistent_color]);
         k_msgq_put(&led_msgq, &item, K_NO_WAIT);
     }
 }
