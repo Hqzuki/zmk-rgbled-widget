@@ -195,21 +195,36 @@ ZMK_SUBSCRIPTION(led_output_listener, zmk_split_peripheral_status_changed);
 
 #if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
 static inline uint8_t get_battery_color(uint8_t battery_level) {
+    /* 71-100: green, 51-70: blue, 21-50: yellow, 1-20: red */
+    enum {
+        BATTERY_COLOR_RED = 1,
+        BATTERY_COLOR_GREEN = 2,
+        BATTERY_COLOR_YELLOW = 3,
+        BATTERY_COLOR_BLUE = 4,
+    };
+
     if (battery_level == 0) {
         LOG_INF("Battery level undetermined (zero), blinking %s",
                 color_names[CONFIG_RGBLED_WIDGET_BATTERY_COLOR_MISSING]);
         return CONFIG_RGBLED_WIDGET_BATTERY_COLOR_MISSING;
     }
-    if (battery_level >= CONFIG_RGBLED_WIDGET_BATTERY_LEVEL_HIGH) {
-        LOG_BATTERY(battery_level, HIGH);
-        return CONFIG_RGBLED_WIDGET_BATTERY_COLOR_HIGH;
+    if (battery_level >= 71) {
+        LOG_INF("Battery level %d, blinking %s", battery_level, color_names[BATTERY_COLOR_GREEN]);
+        return BATTERY_COLOR_GREEN;
     }
-    if (battery_level >= CONFIG_RGBLED_WIDGET_BATTERY_LEVEL_LOW) {
-        LOG_BATTERY(battery_level, MEDIUM);
-        return CONFIG_RGBLED_WIDGET_BATTERY_COLOR_MEDIUM;
+
+    if (battery_level >= 51) {
+        LOG_INF("Battery level %d, blinking %s", battery_level, color_names[BATTERY_COLOR_BLUE]);
+        return BATTERY_COLOR_BLUE;
     }
-    LOG_BATTERY(battery_level, LOW);
-    return CONFIG_RGBLED_WIDGET_BATTERY_COLOR_LOW;
+
+    if (battery_level >= 21) {
+        LOG_INF("Battery level %d, blinking %s", battery_level, color_names[BATTERY_COLOR_YELLOW]);
+        return BATTERY_COLOR_YELLOW;
+    }
+
+    LOG_INF("Battery level %d, blinking %s", battery_level, color_names[BATTERY_COLOR_RED]);
+    return BATTERY_COLOR_RED;
 }
 
 void indicate_battery(void) {
